@@ -15,195 +15,143 @@
 package webhook
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
-	. "github.com/onsi/gomega"
-
 	"bytes"
+	"encoding/json"
+
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 
-	"k8s.io/api/admission/v1beta1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"github.com/intel/multus-cni/types"
+	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/gomega"
+
+	"k8s.io/api/admission/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 var _ = Describe("Webhook", func() {
+	Describe("Mutating", func() {
+		var oldGetNetworkAttachmentDefinition = getNetworkAttachmentDefinition
 
-	Describe("Preparing Admission Review Response", func() {
-		Context("Admission Review Request is nil", func() {
-			It("should return error", func() {
-				ar := &v1beta1.AdmissionReview{}
-				ar.Request = nil
-				Expect(prepareAdmissionReviewResponse(false, "", ar)).To(HaveOccurred())
-			})
+		BeforeEach(func() {
+			oldGetNetworkAttachmentDefinition = getNetworkAttachmentDefinition
 		})
-		Context("Message is not empty", func() {
-			It("should set message in the response", func() {
-				ar := &v1beta1.AdmissionReview{}
-				ar.Request = &v1beta1.AdmissionRequest{
-					UID: "fake-uid",
+
+		AfterEach(func() {
+			getNetworkAttachmentDefinition = oldGetNetworkAttachmentDefinition
+		})
+
+		DescribeTable("Network Attachment Definition validation",
+			func(networkDefinition types.NetworkAttachmentDefinition, pod corev1.Pod, expected []jsonPatchOperation, shouldFail bool) {
+				getNetworkAttachmentDefinition = func(namespace, name string) (*types.NetworkAttachmentDefinition, error) {
+					return &networkDefinition, nil
 				}
-				err := prepareAdmissionReviewResponse(false, "some message", ar)
+
+				jsonPod, err := json.Marshal(&pod)
 				Expect(err).NotTo(HaveOccurred())
-				Expect(ar.Response.Result.Message).To(Equal("some message"))
-			})
-		})
-	})
 
-	Describe("Deserializing Admission Review", func() {
-		Context("It's not an Admission Review", func() {
-			It("should return an error", func() {
-				body := []byte("some-invalid-body")
-				_, err := deserializeAdmissionReview(body)
-				Expect(err).To(HaveOccurred())
-			})
-		})
-	})
+				ar := v1beta1.AdmissionReview{
+					Request: &v1beta1.AdmissionRequest{
+						Object: runtime.RawExtension{
+							Raw: jsonPod,
+						}},
+					TypeMeta: metav1.TypeMeta{
+						Kind: "AdmissionReview",
+					}}
 
-	Describe("Deserializing Network Attachment Definition", func() {
-		Context("It's not an Network Attachment Definition", func() {
-			It("should return an error", func() {
-				ar := &v1beta1.AdmissionReview{}
-				ar.Request = &v1beta1.AdmissionRequest{}
-				_, err := deserializeNetworkAttachmentDefinition(ar)
-				Expect(err).To(HaveOccurred())
-			})
-		})
-	})
+				b, err := json.Marshal(&ar)
+				Expect(err).NotTo(HaveOccurred())
 
-	Describe("Writing a response", func() {
-		Context("with an AdmissionReview", func() {
-			It("should be marshalled and written to a HTTP Response Writer", func() {
-				w := httptest.NewRecorder()
-				ar := &v1beta1.AdmissionReview{}
-				ar.Response = &v1beta1.AdmissionResponse{
-					UID:     "fake-uid",
-					Allowed: true,
-					Result: &metav1.Status{
-						Message: "fake-msg",
-					},
-				}
-				expected := []byte(`{"response":{"uid":"fake-uid","allowed":true,"status":{"metadata":{},"message":"fake-msg"}}}`)
-				writeResponse(w, ar)
-				Expect(w.Body.Bytes()).To(Equal(expected))
-			})
-		})
-	})
-
-	Describe("Handling requests", func() {
-		Context("Request body is empty", func() {
-			It("validate - should return an error", func() {
-				req := httptest.NewRequest("POST", fmt.Sprintf("https://fakewebhook/validate"), nil)
-				w := httptest.NewRecorder()
-				ValidateHandler(w, req)
-				resp := w.Result()
-				Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
-			})
-		})
-
-		Context("Content type is not application/json", func() {
-			It("validate - should return an error", func() {
-				req := httptest.NewRequest("POST", fmt.Sprintf("https://fakewebhook/validate"), bytes.NewBufferString("fake-body"))
-				req.Header.Set("Content-Type", "invalid-type")
-				w := httptest.NewRecorder()
-				ValidateHandler(w, req)
-				resp := w.Result()
-				Expect(resp.StatusCode).To(Equal(http.StatusUnsupportedMediaType))
-			})
-		})
-
-		Context("Deserialization of net-attachment-def failed", func() {
-			It("validate - should return an error", func() {
-				req := httptest.NewRequest("POST", fmt.Sprintf("https://fakewebhook/validate"), bytes.NewBufferString("fake-body"))
+				req := httptest.NewRequest("POST", fmt.Sprintf("https://fakewebhook/validate"), bytes.NewReader(b))
 				req.Header.Set("Content-Type", "application/json")
 				w := httptest.NewRecorder()
-				ValidateHandler(w, req)
+				MutateHandler(w, req)
 				resp := w.Result()
-				Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
-			})
-		})
-	})
 
-	DescribeTable("Network Attachment Definition validation",
-		func(in types.NetworkAttachmentDefinition, out bool, shouldFail bool) {
-			actualOut, err := validateNetworkAttachmentDefinition(in)
-			Expect(actualOut).To(Equal(out))
-			if shouldFail {
-				Expect(err).To(HaveOccurred())
-			}
-		},
-		Entry(
-			"empty config",
-			types.NetworkAttachmentDefinition{},
-			false, true,
-		),
-		Entry(
-			"invalid name",
-			types.NetworkAttachmentDefinition{
-				Metadata: metav1.ObjectMeta{
-					Name: "some?invalid?name",
-				},
+				Expect(resp.StatusCode).To(Equal(http.StatusOK))
+
+				d := json.NewDecoder(resp.Body)
+				result := v1beta1.AdmissionReview{}
+				d.Decode(&result)
+				var patchToApply []jsonPatchOperation
+				json.Unmarshal(result.Response.Patch, &patchToApply)
+
+				Expect(patchToApply).To(Equal(expected))
 			},
-			false, true,
-		),
-		Entry(
-			"invalid network config",
-			types.NetworkAttachmentDefinition{
-				Metadata: metav1.ObjectMeta{
-					Name: "some-valid-name",
-				},
-				Spec: types.NetworkAttachmentDefinitionSpec{
-					Config: `{"some-invalid": "config"}`,
-				},
-			},
-			false, true,
-		),
-		Entry(
-			"valid network config",
-			types.NetworkAttachmentDefinition{
-				Metadata: metav1.ObjectMeta{
-					Name: "some-valid-name",
-				},
-				Spec: types.NetworkAttachmentDefinitionSpec{
-					Config: `{"cniVersion": "0.3.0", "type": "some-plugin"}`,
-				},
-			},
-			true, false,
-		),
-		Entry(
-			"valid network config list",
-			types.NetworkAttachmentDefinition{
-				Metadata: metav1.ObjectMeta{
-					Name: "some-valid-name",
-				},
-				Spec: types.NetworkAttachmentDefinitionSpec{
-					Config: `{
-						"cniVersion": "0.3.0",
-						"name": "some-bridge-network",
-						"plugins": [{
-							"type": "bridge",
-							"bridge": "br0",
-							"ipam": {
-								"type": "host-local",
-								"subnet": "192.168.1.0/24"
-							}
+			Entry(
+				"empty requests",
+				types.NetworkAttachmentDefinition{
+					Metadata: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							networkResourceNameKey: "openshift.io/intel_sriov",
 						},
-						{
-							"type": "some-plugin"
-						},
-						{
-							"type": "another-plugin",
-							"sysctl": {
-								"net.ipv4.conf.all.log_martians": "1"
-							}
-						}]
-					}`,
+					},
 				},
-			},
-			true, false,
-		),
+				corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"k8s.v1.cni.cncf.io/networks": "[{\"interface\":\"net1\",\"name\":\"sriov\",\"namespace\":\"kubevirt-test-default\"}]",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{corev1.Container{}},
+					},
+				},
+				[]jsonPatchOperation{
+					jsonPatchOperation{"add", "/spec/containers/0/resources/requests", map[string]interface{}{"openshift.io/intel_sriov": "1"}},
+					jsonPatchOperation{"add", "/spec/containers/0/resources/limits", map[string]interface{}{"openshift.io/intel_sriov": "1"}},
+				}, false,
+			),
+			Entry(
+				"pod already having requests",
+				types.NetworkAttachmentDefinition{
+					Metadata: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							networkResourceNameKey: "openshift.io/intel_sriov",
+						},
+					},
+				},
+				corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Annotations: map[string]string{
+							"k8s.v1.cni.cncf.io/networks": "[{\"interface\":\"net1\",\"name\":\"sriov\",\"namespace\":\"kubevirt-test-default\"}]",
+						},
+					},
+					Spec: corev1.PodSpec{
+						Containers: []corev1.Container{corev1.Container{
+							Resources: corev1.ResourceRequirements{
+								Limits: corev1.ResourceList{
+									"cpu":    *resource.NewQuantity(100, resource.DecimalSI),
+									"memory": *resource.NewQuantity(12345, resource.DecimalSI),
+								},
+								Requests: corev1.ResourceList{
+									"cpu":    *resource.NewQuantity(100, resource.DecimalSI),
+									"memory": *resource.NewQuantity(12345, resource.DecimalSI),
+								},
+							},
+						}},
+					},
+				},
+				[]jsonPatchOperation{
+					jsonPatchOperation{"add", "/spec/containers/0/resources/requests",
+						map[string]interface{}{
+							"openshift.io/intel_sriov": "1",
+							"cpu":                      "100",
+							"memory":                   "12345"}},
+					jsonPatchOperation{"add", "/spec/containers/0/resources/limits",
+						map[string]interface{}{
+							"openshift.io/intel_sriov": "1",
+							"cpu":                      "100",
+							"memory":                   "12345"}},
+				}, false,
+			),
+		)
+	},
 	)
-})
+},
+)
