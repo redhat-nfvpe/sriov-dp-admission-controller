@@ -135,7 +135,6 @@ func deserializePod(ar *v1beta1.AdmissionReview) (corev1.Pod, error) {
 }
 func parsePodNetworkSelections(podNetworks, defaultNamespace string) ([]*types.NetworkSelectionElement, error) {
 	var networkSelections []*types.NetworkSelectionElement
-
 	if len(podNetworks) == 0 {
 		err := errors.New("empty string passed as network selection elements list")
 		glog.Error(err)
@@ -221,7 +220,7 @@ func parsePodNetworkSelectionElement(selection, defaultNamespace string) (*types
 	return networkSelectionElement, nil
 }
 
-func getNetworkAttachmentDefinition(namespace, name string) (*types.NetworkAttachmentDefinition, error) {
+var getNetworkAttachmentDefinition = func(namespace, name string) (*types.NetworkAttachmentDefinition, error) {
 	path := fmt.Sprintf("/apis/k8s.cni.cncf.io/v1/namespaces/%s/network-attachment-definitions/%s", namespace, name)
 	rawNetworkAttachmentDefinition, err := clientset.ExtensionsV1beta1().RESTClient().Get().AbsPath(path).DoRaw()
 	if err != nil {
@@ -317,20 +316,32 @@ func MutateHandler(w http.ResponseWriter, req *http.Request) {
 		} else {
 			var patch []jsonPatchOperation
 
-			resourceList := corev1.ResourceList{}
+			requests := corev1.ResourceList{}
+			limits := corev1.ResourceList{}
+
+			for name, number := range pod.Spec.Containers[0].Resources.Requests {
+				requests[name] = number
+			}
+			for name, number := range pod.Spec.Containers[0].Resources.Limits {
+				limits[name] = number
+			}
+
 			for name, number := range resourceRequests {
-				resourceList[corev1.ResourceName(name)] = *resource.NewQuantity(number, resource.DecimalSI)
+				requests[corev1.ResourceName(name)] = *resource.NewQuantity(number, resource.DecimalSI)
+			}
+			for name, number := range resourceRequests {
+				limits[corev1.ResourceName(name)] = *resource.NewQuantity(number, resource.DecimalSI)
 			}
 
 			patch = append(patch, jsonPatchOperation{
 				Operation: "add",
 				Path:      "/spec/containers/0/resources/requests", // NOTE: in future we may want to patch specific container (not always the first one)
-				Value:     resourceList,
+				Value:     requests,
 			})
 			patch = append(patch, jsonPatchOperation{
 				Operation: "add",
 				Path:      "/spec/containers/0/resources/limits",
-				Value:     resourceList,
+				Value:     limits,
 			})
 			patchBytes, _ := json.Marshal(patch)
 			ar.Response.Patch = patchBytes
